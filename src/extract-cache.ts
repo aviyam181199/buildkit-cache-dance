@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { CacheOptions, Opts, getBuilder, getCacheMap, getMountArgsString, getTargetPath } from './opts.js';
-import { run } from './run.js';
+import { run, runPiped } from './run.js';
 
 async function extractCache(cacheSource: string, cacheOptions: CacheOptions, scratchDir: string, containerImage: string, builder: string) {
     // Prepare Timestamp for Layer Cache Busting
@@ -15,19 +15,24 @@ async function extractCache(cacheSource: string, cacheOptions: CacheOptions, scr
     const mountArgs = getMountArgsString(cacheOptions);
 
     const dancefileContent = `
-FROM ${containerImage} AS dance-extract
+FROM ${containerImage}
 COPY buildstamp buildstamp
 RUN --mount=${mountArgs} \
     mkdir -p /var/dance-cache/ \
     && cp -p -R ${targetPath}/. /var/dance-cache/ || true
-FROM scratch
-COPY --from=dance-extract --chmod=u=rwX,go=rX /var/dance-cache /
 `;
     await fs.writeFile(path.join(scratchDir, 'Dancefile.extract'), dancefileContent);
     console.log(dancefileContent);
 
-    // Extract cache
-    await run('docker', ['buildx', 'build', '--builder', builder, '-f', path.join(scratchDir, 'Dancefile.extract'), '--tag', 'dance:extract', '--output', `type=local,dest=${cacheSource}`, scratchDir]);
+    // Clean destination and extract cache directly via tar stream.
+    // This avoids the v3.3.1 hang caused by FROM scratch + --output type=local
+    // and is simpler than v3.3.0's load + container + docker cp approach.
+    await run('sudo', ['rm', '-rf', cacheSource]);
+    await fs.mkdir(cacheSource, { recursive: true });
+    await runPiped(
+        ['docker', ['buildx', 'build', '--builder', builder, '-f', path.join(scratchDir, 'Dancefile.extract'), '--output', 'type=tar,dest=-', scratchDir]],
+        ['tar', ['-x', '--strip-components=2', '-C', cacheSource, 'var/dance-cache']]
+    );
 }
 
 export async function extractCaches(opts: Opts) {
